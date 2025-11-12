@@ -1,0 +1,167 @@
+----------------------------------------------------------------------------------
+-- Company: 
+-- Engineer: 
+-- 
+-- Create Date: 23.09.2024 14:32:11
+-- Design Name: 
+-- Module Name: karazuba_mult
+-- Project Name: TFHE Acceleration with FPGA
+-- Target Devices: Virtex UltraScale+ HBM VCU128 FPGA
+-- Tool Versions: Vivado 2024.1
+-- Description: n-bit times n-bit multiplication using Karazuba to split it into
+--             three n/2-bit multiplications.
+--             For num0 = a1*2**(n/2)+a0 and num1 = b1*2**(n/2)+b0 It computes:
+--             p1*2**(n) + (p3-(p1+p2))*2**(n/2)+p2
+--             where
+--             p1=a1*b1
+--             p2=a0*b0
+--             p3=(a1+a0)*(b1+b0)
+-- Dependencies: see imports
+-- 
+-- Revision:
+-- Revision 0.01 - File Created
+-- Additional Comments:
+-- 
+----------------------------------------------------------------------------------
+
+library IEEE;
+     use IEEE.STD_LOGIC_1164.all;
+     use IEEE.numeric_std.all;
+library work;
+     use work.constants_utils.all;
+     use work.datatypes_utils.all;
+
+entity karazuba_mult is
+     generic (
+          base_len            : integer;
+          dsp_retiming_length : integer
+     );
+     port (
+          i_clk  : in  std_ulogic;
+          i_num0 : in  unsigned(0 to 2 * base_len - 1);
+          i_num1 : in  unsigned(0 to 2 * base_len - 1);
+          o_res  : out unsigned(0 to 4 * base_len - 1)
+     );
+end entity;
+
+architecture Behavioral of karazuba_mult is
+
+     component mult_dsp_level is
+          generic (
+               base_len            : integer;
+               dsp_retiming_length : integer
+          );
+          port (
+               i_clk  : in  std_ulogic;
+               i_num0 : in  unsigned(0 to base_len - 1);
+               i_num1 : in  unsigned(0 to base_len - 1);
+               o_res  : out unsigned(0 to 2 * base_len - 1)
+          );
+     end component;
+
+     -- constant base_signed : integer := base_len + 1;
+     subtype half_reg is unsigned(0 to base_len - 1);
+     subtype full_reg is unsigned(0 to 2 * base_len - 1);
+     type half_reg_wait_regs is array (natural range <>) of half_reg;
+     type full_reg_wait_regs is array (natural range <>) of full_reg;
+
+     signal a0 : half_reg;
+     signal b0 : half_reg;
+     signal a1 : half_reg;
+     signal b1 : half_reg;
+     signal p1       : full_reg; -- with the max values for a1 & b1 its 64 bits unsigned
+     signal p2       : full_reg; -- with the max values for a0 & b0 its 64 bits unsigned
+     signal p2_upper : half_reg;
+     signal p2_lower : half_reg;
+
+     signal a1_plus_a0 : unsigned(0 to a1'length + 1 - 1);         -- +1 for carry
+     signal b1_plus_b0 : unsigned(0 to b1'length + 1 - 1);         -- +1 for carry
+     signal p3         : unsigned(0 to 2 * a1_plus_a0'length - 1); -- with the max values for a1,a0,b1 & b0 its 66 bits unsigned
+
+     signal p2_minus_p2upper : unsigned(0 to p2'length - 1); -- no carry possible
+     -- signal p1_plus_p2_minus_p2upper : unsigned(0 to (p1'length + 2) - 1); -- +2 for carry
+     signal p123_temp         : unsigned(0 to p3'length - 1);
+     signal p123_temp_upper   : unsigned(0 to p3'length-base_len - 1);
+     signal p123_temp_lower   : unsigned(0 to base_len - 1);
+     signal p123_temp_lower_buf   : unsigned(0 to p123_temp_lower'length - 1);
+
+     signal p123 : unsigned(0 to 2 * base_len - 1); -- p3=p1+p2+a1*b0+a0*b1 --> p3-(p1+p2) is always positive here
+
+     signal p1_wait_reg_2      : full_reg;
+     signal p1_wait_reg_3      : full_reg;
+     signal p2_lower_wait_regs : half_reg_wait_regs(0 to 3 - 1);
+
+begin
+     -- MSB is at index 0
+     -- leading 0 ensures the numbers are not interpreted as negative numbers
+     a1 <= i_num0(0 to base_len - 1);
+     b1 <= i_num1(0 to base_len - 1);
+     a0 <= i_num0(base_len to i_num0'length - 1);
+     b0 <= i_num1(base_len to i_num1'length - 1);
+     p2_upper <= (p2(0 to base_len - 1));
+     p2_lower <= (p2(base_len to 2 * base_len - 1));
+     p123_temp_upper <= (p123_temp(0 to p123_temp_upper'length - 1));
+     p123_temp_lower <= (p123_temp(p123_temp_upper'length to p123_temp'length - 1));
+
+     o_res <= unsigned(std_ulogic_vector(p123) & std_ulogic_vector(p123_temp_lower_buf) & std_ulogic_vector(p2_lower_wait_regs(p2_lower_wait_regs'length - 1)));
+
+     p1_mult: mult_dsp_level
+          generic map (
+               base_len            => a1'length,
+               dsp_retiming_length => dsp_retiming_length
+          )
+          port map (
+               i_clk  => i_clk,
+               i_num0 => a1,
+               i_num1 => b1,
+               o_res  => p1
+          );
+     p2_mult: mult_dsp_level
+          generic map (
+               base_len            => a0'length,
+               dsp_retiming_length => dsp_retiming_length
+          )
+          port map (
+               i_clk  => i_clk,
+               i_num0 => a0,
+               i_num1 => b0,
+               o_res  => p2
+          );
+     p3_mult: mult_dsp_level
+          generic map (
+               base_len            => a1_plus_a0'length,
+               dsp_retiming_length => dsp_retiming_length
+          )
+          port map (
+               i_clk  => i_clk,
+               i_num0 => a1_plus_a0,
+               i_num1 => b1_plus_b0,
+               o_res  => p3
+          );
+
+     process (i_clk)
+     begin
+          if rising_edge(i_clk) then
+               a1_plus_a0 <= ('0' & a1) + a0; -- extend one operand for the carry bit
+               b1_plus_b0 <= ('0' & b1) + b0; -- extend one operand for the carry bit
+
+               -- stage x-1
+               -- we rewrite (p3-(p1+p2))*2**(n/2)+p2 to (p3-(p1+p2))+p2_upper || p2_lower = p3-(p1+p2-p2_upper) || p2_lower
+               -- p1 and p2 finish one tic earlier than p3
+               -- use that time to calculate p2-p2_upper
+               p2_minus_p2upper <= p2 - p2_upper; -- cannot be negative
+               p1_wait_reg_2 <= p1;
+               p2_lower_wait_regs(0) <= p2_lower;
+               p2_lower_wait_regs(1 to p2_lower_wait_regs'length - 1) <= p2_lower_wait_regs(0 to p2_lower_wait_regs'length - 2);
+               -- stage x
+               -- p3 is there
+               p123_temp <= p3 - p1_wait_reg_2 - p2_minus_p2upper;
+               p1_wait_reg_3 <= p1_wait_reg_2;
+
+               -- stage x+1
+               p123_temp_lower_buf <= p123_temp_lower;
+               p123 <= p1_wait_reg_3 + p123_temp_upper;
+          end if;
+     end process;
+
+end architecture;

@@ -1,0 +1,413 @@
+----------------------------------------------------------------------------------
+-- Company: 
+-- Engineer: 
+-- 
+-- Create Date: 23.09.2024 14:32:11
+-- Design Name: 
+-- Module Name: rotate_polym
+-- Project Name: TFHE Acceleration with FPGA
+-- Target Devices: Virtex UltraScale+ HBM VCU128 FPGA
+-- Tool Versions: Vivado 2024.1
+-- Description: rotates a polynom by i_ai. Works together with polym_buffer.vhd, from which it requests values via o_request_idx.
+--             i_rotate_by must be kept stable for polynom'length/throughput clock cycles.
+--             Default rotation for polynoms like a0*x^2 + a1*x + a2 is to the left. Use reversed to change the direction.
+--             Left-rotation by 1 results in: a1*x^2 + a2*x - a0
+--             Right-rotation by 1 results in: -a2*x^2 + a0*x + a1
+--             The module assumes that i_rotate_by is given (counter_buffer_len-1) tics after reset drops and i_sub_coeffs is valid one
+--             tic after reset drops (this avoids a polym-sized buffer)
+--             The module assumes that the input is in ntt-mixed format!
+-- Dependencies: see imports
+-- 
+-- Revision:
+-- Revision 0.01 - File Created
+-- Additional Comments:
+-- 
+----------------------------------------------------------------------------------
+
+library IEEE;
+     use IEEE.STD_LOGIC_1164.all;
+     use IEEE.NUMERIC_STD.all;
+library work;
+     use work.datatypes_utils.all;
+     use work.constants_utils.all;
+     use work.tfhe_constants.all;
+     use work.math_utils.all;
+
+entity rotate_polym is
+     generic (
+          throughput   : integer;
+          rotate_right : boolean;
+          negated      : boolean -- set to true to negate the values in the output
+     );
+     port (
+          i_clk               : in  std_ulogic;
+          i_reset             : in  std_ulogic;
+          i_sub_coeffs        : in  sub_polynom(0 to throughput - 1);
+          i_rotate_by         : in  rotate_idx;
+          o_ram_coeff_idx     : out unsigned(0 to get_bit_length((num_coefficients / throughput) - 1) * throughput / 2 - 1);
+          o_result            : out sub_polynom(0 to throughput - 1);
+          o_next_module_reset : out std_ulogic
+     );
+end entity;
+
+architecture Behavioral of rotate_polym is
+
+     component add_reduce is
+          generic (
+               substraction : boolean;
+               modulus      : synthesiseable_uint
+          );
+          port (
+               i_clk    : in  std_ulogic;
+               i_num0   : in  synthesiseable_uint;
+               i_num1   : in  synthesiseable_uint;
+               o_result : out synthesiseable_uint
+          );
+     end component;
+
+     component one_time_counter is
+          generic (
+               tripping_value     : integer;
+               out_negated        : boolean;
+               bufferchain_length : integer
+          );
+          port (
+               i_clk     : in  std_ulogic;
+               i_reset   : in  std_ulogic;
+               o_tripped : out std_ulogic
+          );
+     end component;
+
+     type wait_registers_sub_polym is array (natural range <>) of sub_polynom(0 to o_result'length - 1);
+
+     signal ai_roll_factor     : idx_int;
+     signal ai_roll_factor_msb : std_ulogic;
+     signal ai_sign_part       : std_ulogic;
+
+     signal index_plus_ai_reduced        : idx_int_array(0 to o_result'length - 1);      -- does modulo automatically
+     signal index_plus_ai_reduced_buffer : idx_int_array(0 to o_result'length / 2 - 1);  -- does modulo automatically
+
+     type in_coeff_cnt_buf is array(natural range <>) of unsigned(0 to log2_num_coefficients - 1 - 1); -- another -1 because need half cnt for ntt mixed format
+     signal input_coeff_cnt      : in_coeff_cnt_buf(0 to counter_buffer_len-1);
+
+     signal index_original_value        : idx_int_array(0 to o_result'length - 1); -- does modulo automatically
+     signal index_original_value_buffer : idx_int_array(0 to o_result'length - 1);
+
+     constant polym_part_rolled_wait_reg_chain_len : integer := clks_per_64_bit_add_mod;
+     signal polym_part_rolled_wait_reg_chain       : wait_registers_sub_polym(0 to polym_part_rolled_wait_reg_chain_len - 1 - 1); -- -1 because of polym_part_rolled_wait_reg_chain_end
+     signal polym_part_rolled_wait_reg_chain_end   : sub_polynom(0 to o_result'length - 1);
+     signal polym_part_rolled                      : sub_polynom(0 to o_result'length - 1);
+     signal polym_part_rolled_sign_flipped_reduced : sub_polynom(0 to o_result'length - 1);
+
+     signal roll_info : std_ulogic_vector(0 to o_result'length - 1);
+     type bools_wait_reg is array (natural range <>) of std_ulogic_vector(0 to polym_part_rolled_wait_reg_chain_len + buffer_answer_delay + rotate_polym_reorder_delay - 1);
+     signal roll_info_wait_regs : bools_wait_reg(0 to o_result'length - 1);
+
+     signal switch_sign_wait_regs : std_ulogic_vector(0 to (roll_info_wait_regs(0)'length + 2) - 1); -- +2 because of the stages until a request to the outside buffer is made
+
+     constant zero_val : synthesiseable_uint := to_synth_uint(0);
+     constant compare_val               : std_ulogic_vector(0 to 0)        := std_ulogic_vector(to_unsigned(boolean'pos(not negated), 1));
+
+     constant coeffs_per_ram_block            : integer := num_coefficients / throughput;
+     constant coeffs_per_ram_block_bit_length : integer := get_bit_length(coeffs_per_ram_block - 1);
+     constant log2_throughput                 : integer := get_bit_length(throughput - 1);
+     constant log2_half_throughput             : integer := log2_throughput-1;
+     signal lowest_idx_signal  : unsigned(0 to get_max(1,log2_half_throughput) - 1);
+     signal input_rearanged    : sub_polynom(0 to o_result'length - 1);
+     signal ai_throughput_part : unsigned(0 to get_max(1,log2_half_throughput) - 1);
+     signal long_offset        : unsigned(0 to log2_throughput-1);
+     signal block_offset       : unsigned(0 to get_max(1,log2_half_throughput) - 1);
+
+     signal index_plus_ai_reduced_buffer_2_part : unsigned(0 to get_max(1,long_offset'length - 1) - 1);
+     signal index_plus_ai_reduced_buffer_2_msb  : std_ulogic;
+
+     type block_offset_chain is array (natural range <>) of unsigned(0 to block_offset'length - 1);
+     type long_offset_chain is array (natural range <>) of unsigned(0 to long_offset'length - 1);
+     signal long_offset_buf  : long_offset_chain(0 to buffer_answer_delay-1 - 1); -- -1 because input is seperate
+     signal block_offset_buf : block_offset_chain(0 to buffer_answer_delay-1 - 1); -- -1 because input is seperate
+
+     constant rolling_polym_part_rolled_buffer : boolean := false;
+     signal polym_part_rolled_wait_regs_cnt : unsigned(0 to get_bit_length(polym_part_rolled_wait_reg_chain'length - 1) - 1) := to_unsigned(0, get_bit_length(polym_part_rolled_wait_reg_chain'length - 1));
+
+begin
+
+     initial_latency_counter: one_time_counter
+          generic map (
+               tripping_value     => rotate_polym_first_block_initial_delay-(counter_buffer_len-1),
+               out_negated        => true,
+               bufferchain_length => trailing_reset_buffer_len
+          )
+          port map (
+               i_clk     => i_clk,
+               i_reset   => i_reset,
+               o_tripped => o_next_module_reset
+          );
+
+     sign_flip_polym_part: for i in 0 to polym_part_rolled'length - 1 generate
+          big_sub_module: add_reduce
+               generic map (
+                    substraction => true,
+                    modulus      => tfhe_modulus
+               )
+               port map (
+                    i_clk    => i_clk,
+                    i_num0   => zero_val,
+                    i_num1   => polym_part_rolled(i),
+                    o_result => polym_part_rolled_sign_flipped_reduced(i)
+               );
+     end generate;
+
+     -- MSB is at idx 0. We want log2_num_coefficients+1 LSBs as everything above is moduloed away anyway.
+     -- assuming that i_ai is not negative (which should be the case since our modulo reductions always return positive values)
+     -- the upper bit of i_rotate_by decides how we do the sign switch, we only care if its an even or odd number
+     -- and the lower bits contain the number that we are actually rotating the polynom by
+     ai_roll_factor <= i_rotate_by(1 to i_rotate_by'length - 1);
+     ai_sign_part   <= i_rotate_by(0);
+
+     rolling_buffer_polym_part_rolled: if rolling_polym_part_rolled_buffer generate
+          process (i_clk)
+          begin
+               if rising_edge(i_clk) then
+                    polym_part_rolled_wait_reg_chain(0) <= polym_part_rolled;
+                    polym_part_rolled_wait_reg_chain(1 to polym_part_rolled_wait_reg_chain'length - 1) <= polym_part_rolled_wait_reg_chain(0 to polym_part_rolled_wait_reg_chain'length - 2);
+                    polym_part_rolled_wait_reg_chain_end <= polym_part_rolled_wait_reg_chain(polym_part_rolled_wait_reg_chain'length - 1);
+               end if;
+          end process;
+     end generate;
+
+     non_rolling_buffer_polym_part_rolled: if not rolling_polym_part_rolled_buffer generate
+          process (i_clk)
+          begin
+               if rising_edge(i_clk) then
+                    if polym_part_rolled_wait_regs_cnt < to_unsigned(polym_part_rolled_wait_reg_chain'length - 1, polym_part_rolled_wait_regs_cnt'length) then
+                         polym_part_rolled_wait_regs_cnt <= polym_part_rolled_wait_regs_cnt + to_unsigned(1, polym_part_rolled_wait_regs_cnt'length);
+                    else
+                         polym_part_rolled_wait_regs_cnt <= to_unsigned(0, polym_part_rolled_wait_regs_cnt'length);
+                    end if;
+                    polym_part_rolled_wait_reg_chain(to_integer(polym_part_rolled_wait_regs_cnt)) <= polym_part_rolled;
+                    polym_part_rolled_wait_reg_chain_end <= polym_part_rolled_wait_reg_chain(to_integer(polym_part_rolled_wait_regs_cnt));
+               end if;
+          end process;
+     end generate;
+
+     shift_regs: for i in 0 to roll_info_wait_regs'length - 1 generate
+          -- vivado should infer this as shift registers
+          process (i_clk)
+          begin
+               if rising_edge(i_clk) then
+                    roll_info_wait_regs(i) <= roll_info(i) & roll_info_wait_regs(i)(0 to roll_info_wait_regs(0)'length - 2);
+               end if;
+          end process;
+     end generate;
+
+     rotate_left_logic: if not rotate_right generate
+          lowest_idx_signal_computation: if log2_half_throughput > 0 generate
+               process (i_clk) is
+               begin
+                    if rising_edge(i_clk) then
+                         -- compared to rotate right: lowest idx is usually at 0
+                         -- if last idx rolled over (check with substracting throughput/2) than it is at 0 minus the last idx value
+                         -- and if not there at throughput/2-1
+                         if ai_roll_factor_msb = '0' then
+                              if index_plus_ai_reduced(index_plus_ai_reduced'length - 1) - to_unsigned(throughput / 2, index_plus_ai_reduced(0)'length) < index_plus_ai_reduced(index_plus_ai_reduced'length - 1) then
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+                              else
+                                   lowest_idx_signal <= to_unsigned(index_plus_ai_reduced'length - 1, lowest_idx_signal'length) - index_plus_ai_reduced(index_plus_ai_reduced'length - 1)(index_plus_ai_reduced(0)'length - lowest_idx_signal'length to index_plus_ai_reduced(0)'length - 1);
+                              end if;
+                         else
+                              if index_plus_ai_reduced(throughput / 2 - 1) - to_unsigned(throughput / 2, index_plus_ai_reduced(0)'length) < index_plus_ai_reduced(throughput / 2 - 1) then
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+                              else
+                                   lowest_idx_signal <= to_unsigned(index_plus_ai_reduced'length - 1, lowest_idx_signal'length) - index_plus_ai_reduced(throughput / 2 - 1)(index_plus_ai_reduced(0)'length - lowest_idx_signal'length to index_plus_ai_reduced(0)'length - 1);
+                              end if;
+                         end if;
+                    end if;
+               end process;
+          end generate;
+          no_lowest_idx_signal_computation: if not (log2_half_throughput > 0) generate
+               lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+          end generate;
+
+          process (i_clk)
+          begin
+               if rising_edge(i_clk) then
+
+                    for i in 0 to index_plus_ai_reduced'length / 2 - 1 loop
+                         o_ram_coeff_idx(i * coeffs_per_ram_block_bit_length to (i + 1) * coeffs_per_ram_block_bit_length - 1) <= index_plus_ai_reduced((to_integer(to_unsigned(i, ai_throughput_part'length) - ai_throughput_part)))(1 to 1 + coeffs_per_ram_block_bit_length - 1); -- here is a change to rotate right
+                    end loop;
+
+                    for i in 0 to index_plus_ai_reduced'length - 1 loop
+                         index_plus_ai_reduced(i) <= index_original_value(i) + ai_roll_factor; -- here is a change to rotate right
+
+                         if index_plus_ai_reduced(i) < index_original_value_buffer(i) then -- here is a change to rotate right
+                              roll_info(i) <= '1';
+                         else
+                              roll_info(i) <= '0';
+                         end if;
+                    end loop;
+               end if;
+          end process;
+     end generate;
+
+     rotate_right_logic: if rotate_right generate
+          lowest_idx_signal_computation: if log2_half_throughput > 0 generate
+               process (i_clk) is
+               begin
+                    if rising_edge(i_clk) then
+                         -- need to find block_offset, which determines the order in which a bufferblock-group is read
+                         -- block_offset is the block index of the lowest index that we request
+                         -- we want to read from the lowest idx upwards
+                         -- the lowest idx is always at position 0 but not if that idx+throughput/2 < idx
+                         -- since we count up: if at idx 0 is not the lowest, the lowest must be at idx = num_coeffs-1 - index_plus_ai_reduced(0) + 1 = -index_plus_ai_reduced(0) mod throughput
+                         -- exception: if ai_roll_factor >= N/2 then lowest idx is at position throughput/2
+                         if ai_roll_factor_msb = '0' then
+                              if index_plus_ai_reduced(0) + to_unsigned(throughput / 2, index_plus_ai_reduced(0)'length) > index_plus_ai_reduced(0) then
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+                              else
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length) - index_plus_ai_reduced(0)(index_plus_ai_reduced(0)'length - lowest_idx_signal'length to index_plus_ai_reduced(0)'length - 1);
+                              end if;
+                         else
+                              if index_plus_ai_reduced(throughput / 2) + to_unsigned(throughput / 2, index_plus_ai_reduced(0)'length) > index_plus_ai_reduced(throughput / 2) then
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+                              else
+                                   lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length) - index_plus_ai_reduced(throughput / 2)(index_plus_ai_reduced(0)'length - lowest_idx_signal'length to index_plus_ai_reduced(0)'length - 1);
+                              end if;
+                         end if;
+                    end if;
+               end process;
+          end generate;
+          no_lowest_idx_signal_computation: if not (log2_half_throughput > 0) generate
+               lowest_idx_signal <= to_unsigned(0, lowest_idx_signal'length);
+          end generate;
+
+          process (i_clk)
+          begin
+               if rising_edge(i_clk) then
+                    for i in 0 to index_plus_ai_reduced'length / 2 - 1 loop
+                         -- index_plus_ai_reduced: ignore first bit, it is for ntt mixed half
+                         -- first ram_coeff_idx is for the first block, second for the second block and so on
+                         -- where is the coefficient idx for the first block? At ai mod (throughput/2).
+                         o_ram_coeff_idx(i * coeffs_per_ram_block_bit_length to (i + 1) * coeffs_per_ram_block_bit_length - 1) <= index_plus_ai_reduced((to_integer(to_unsigned(i, ai_throughput_part'length) + ai_throughput_part)))(1 to 1 + coeffs_per_ram_block_bit_length - 1);
+                    end loop;
+
+                    for i in 0 to index_plus_ai_reduced'length - 1 loop
+                         -- if we rotate by 0 we request coefficients 0,1,2,3,...
+                         -- if we rotate by 1 to the right we want to request coefficients -1,0,1,2 because the last coefficient rolls over
+                         -- and becomes the new first coefficient. Bottom line: rotate right = subtract ai_roll_factor
+                         index_plus_ai_reduced(i) <= index_original_value(i) - ai_roll_factor;
+
+                         if index_plus_ai_reduced(i) > index_original_value_buffer(i) then
+                              roll_info(i) <= '1'; -- coefficient rolled over polynom bounds
+                         else
+                              roll_info(i) <= '0'; -- coefficient stayed within polynom bounds
+                         end if;
+                    end loop;
+               end if;
+          end process;
+     end generate;
+
+     half_throughput_computation: if log2_half_throughput > 0 generate
+          process (i_clk) is
+          begin
+               if rising_edge(i_clk) then
+                    ai_throughput_part <= ai_roll_factor(ai_roll_factor'length - ai_throughput_part'length to ai_roll_factor'length - 1);
+                    
+                    -- we use block offset to rearrange what the polynom-buffer provided us with
+                    block_offset <= index_plus_ai_reduced_buffer(to_integer(lowest_idx_signal))(index_plus_ai_reduced_buffer(0)'length - block_offset'length to index_plus_ai_reduced_buffer(0)'length - 1);
+
+                    -- long_offset is the idx from which we start reading the result
+                    -- the coefficients inside the mixed-halves are in the right order
+                    -- where do we find the first idx in the result? At the position of its buffer block? No, the blocks are sorted.
+                    -- only need to know the half and then from where to read the half
+                    -- read the half from the buffer block of the index and correct by block_offset
+                    index_plus_ai_reduced_buffer_2_part <= index_plus_ai_reduced_buffer(0)(index_plus_ai_reduced_buffer(0)'length - (long_offset'length - 1) to index_plus_ai_reduced_buffer(0)'length - 1);
+                    long_offset <= index_plus_ai_reduced_buffer_2_msb & (index_plus_ai_reduced_buffer_2_part - block_offset);
+                    ai_roll_factor_msb <= ai_roll_factor(0);
+               end if;
+          end process;
+     end generate;
+     no_half_throughput_computation: if not (log2_half_throughput > 0) generate
+          ai_throughput_part <= to_unsigned(0,ai_throughput_part'length);
+          block_offset <= to_unsigned(0,block_offset'length);
+          ai_roll_factor_msb <= '0';
+          process (i_clk) is
+          begin
+               if rising_edge(i_clk) then
+                    long_offset(0) <= index_plus_ai_reduced_buffer_2_msb;
+               end if;
+          end process;
+     end generate;
+
+     process (i_clk)
+     begin
+          if rising_edge(i_clk) then
+               -- stage 0
+               -- switch sign computation
+               switch_sign_wait_regs(0) <= ai_sign_part;
+               switch_sign_wait_regs(1 to switch_sign_wait_regs'length - 1) <= switch_sign_wait_regs(0 to switch_sign_wait_regs'length - 2);
+               -- index_original_value is one too early so ai_roll_factor does not need to be buffered
+               index_original_value_buffer <= index_original_value;
+               -- stage 0 computes index_plus_ai_reduced in another process
+
+               -- stage 1
+               -- uses index_plus_ai_reduced to compute roll_info
+               -- stage 2 and 3: computation of polym_part_rolled
+               index_plus_ai_reduced_buffer <= index_plus_ai_reduced(0 to index_plus_ai_reduced_buffer'length - 1);
+               index_plus_ai_reduced_buffer_2_msb <= index_plus_ai_reduced_buffer(0)(0);
+
+               -- i_sub_coeffs arrive a bit later due to pingpong_ram_retiming_latency!
+               -- delay block_offset and long_offset
+               long_offset_buf(0) <= long_offset;
+               block_offset_buf(0) <= block_offset;
+               long_offset_buf(1 to long_offset_buf'length - 1) <= long_offset_buf(0 to long_offset_buf'length - 2);
+               block_offset_buf(1 to block_offset_buf'length - 1) <= block_offset_buf(0 to block_offset_buf'length - 2);
+               for i in 0 to throughput / 2 - 1 loop
+                    input_rearanged(i) <= i_sub_coeffs(to_integer(to_unsigned(i, block_offset_buf(0)'length) + block_offset_buf(block_offset_buf'length - 1)));
+                    input_rearanged(i + throughput / 2) <= i_sub_coeffs(to_integer(to_unsigned(i, block_offset_buf(0)'length) + block_offset_buf(block_offset_buf'length - 1)) + throughput / 2);
+               end loop;
+               for i in 0 to i_sub_coeffs'length - 1 loop
+                    polym_part_rolled(i) <= input_rearanged(to_integer(to_unsigned(i, long_offset_buf(0)'length) + long_offset_buf(long_offset_buf'length - 1)));
+               end loop;
+
+               -- stage 2 to x: computation of polym_part_rolled_sign_flipped_reduced
+               -- roll_info is computed
+               -- stage x+1
+               for i in 0 to o_result'length - 1 loop
+                    if (switch_sign_wait_regs(switch_sign_wait_regs'length - 1) = '1') xor (roll_info_wait_regs(i)(roll_info_wait_regs(0)'length - 1) = compare_val(0)) then
+                         -- coefficient sign changed
+                         o_result(i) <= polym_part_rolled_sign_flipped_reduced(i);
+                    else
+                         -- coefficient is unchanged
+                         o_result(i) <= polym_part_rolled_wait_reg_chain_end(i);
+                    end if;
+               end loop;
+          end if;
+     end process;
+
+     process (i_clk)
+     begin
+          if rising_edge(i_clk) then
+               -- getting this counter going is the reason for why reset must be dropped an additional clock tic earlier
+               if i_reset = '1' then
+                    input_coeff_cnt(0) <= to_unsigned(0, input_coeff_cnt(0)'length);
+               else
+                    input_coeff_cnt(0) <= input_coeff_cnt(0) + to_unsigned(throughput / 2, input_coeff_cnt(0)'length);
+               end if;
+
+               for i in 0 to index_original_value'length / 2 - 1 loop
+                    index_original_value(i) <= to_unsigned(i, idx_int'length) + resize(input_coeff_cnt(input_coeff_cnt'length-1), idx_int'length);
+                    index_original_value(throughput / 2 + i) <= to_unsigned(i + num_coefficients / 2, idx_int'length) + resize(input_coeff_cnt(input_coeff_cnt'length-1), idx_int'length);
+               end loop;
+          end if;
+     end process;
+     
+     cnt_buf: if input_coeff_cnt'length > 1 generate
+          process (i_clk) is
+          begin
+               if rising_edge(i_clk) then
+                    input_coeff_cnt(1 to input_coeff_cnt'length-1) <= input_coeff_cnt(0 to input_coeff_cnt'length-2);
+               end if;
+          end process;
+     end generate;
+
+end architecture;

@@ -1,0 +1,31 @@
+
+## CLK
+set_property IOSTANDARD LVDS [get_ports clk_pin_p]
+set_property IOSTANDARD LVDS [get_ports clk_pin_n]
+set_property PACKAGE_PIN F35 [get_ports clk_pin_p]
+set_property PACKAGE_PIN F36 [get_ports clk_pin_n]
+
+set_property IOSTANDARD LVCMOS18 [get_ports clk2_pin_p]
+# set_property IOSTANDARD LVCMOS18 [get_ports clk2_pin_n]
+set_property IOSTANDARD LVCMOS18 [get_ports clk3_pin_p]
+# set_property IOSTANDARD LVCMOS18 [get_ports clk3_pin_n]
+##set_property CONFIG_VOLTAGE 1.8 [current_design]
+set_property PACKAGE_PIN BJ4 [get_ports clk2_pin_p]
+# set_property PACKAGE_PIN BK3 [get_ports clk2_pin_n]
+set_property PACKAGE_PIN BH51 [get_ports clk3_pin_p]
+# set_property PACKAGE_PIN BJ51 [get_ports clk3_pin_n]
+set_property CFGBVS GND [current_design]
+
+# set_property IOSTANDARD LVDS [get_ports gty_ref_clk_pin_p]
+# set_property IOSTANDARD LVDS [get_ports gty_ref_clk_pin_n]
+# set_property IOSTANDARD LVDS [get_ports gty_clk_pin_p]
+# set_property IOSTANDARD LVDS [get_ports gty_clk_pin_n]
+# set_property PACKAGE_PIN AA40 [get_ports gty_ref_clk_pin_p]
+# set_property PACKAGE_PIN AA41 [get_ports gty_ref_clk_pin_n]
+# set_property PACKAGE_PIN BK26 [get_ports gty_clk_pin_p]
+# set_property PACKAGE_PIN BL25 [get_ports gty_clk_pin_n]
+
+set_property IOSTANDARD LVDS [get_ports pcie_ref_clk_pin_p]
+set_property IOSTANDARD LVDS [get_ports pcie_ref_clk_pin_n]
+set_property PACKAGE_PIN AR15 [get_ports pcie_ref_clk_pin_p]
+set_property PACKAGE_PIN AR14 [get_ports pcie_ref_clk_pin_n]
