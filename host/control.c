@@ -1,46 +1,47 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
-#define CTRL_ADDR   0x0          // AXI-Lite register controlling device state
-#define TMP_FILE    "/tmp/tfhe_c.bin"
+#define XDMA_USER_DEV "/dev/xdma0_user"
+#define MAP_SIZE      4096        // Matches AXI-Lite BAR size
+#define REG_OFFSET    0x0         // slv_reg0
 
-#define DMA_TO_DEVICE "/home/fpga/Documents/dma_ip_drivers/XDMA/linux-kernel/tools/dma_to_device"
-
-int main(int argc, char **argv)
+int main(int argc, char *argv[])
 {
     if (argc != 2) {
-        printf("Usage: %s <pattern_id>\n", argv[0]);
-        printf("Example: %s 3\n", argv[0]);
+        printf("Usage: %s <pattern>\n", argv[0]);
         return 1;
     }
 
-    uint32_t pattern = (uint32_t)atoi(argv[1]);
+    uint32_t pattern = atoi(argv[1]);
 
-    // Write pattern to temporary file
-    FILE *f = fopen(TMP_FILE, "wb");
-    if (!f) {
-        perror("Cannot create temp file");
+    int fd = open(XDMA_USER_DEV, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        perror("open");
         return 1;
     }
 
-    fwrite(&pattern, sizeof(pattern), 1, f);
-    fclose(f);
+    void *map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0);
 
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-        "sudo  %s -d /dev/xdma0_user -a %u -f %s -s 4",
-        DMA_TO_DEVICE, CTRL_ADDR, TMP_FILE);
-
-    printf("Sending control instruction %u...\n", pattern);
-    printf("CMD: %s\n", cmd);
-
-    int ret = system(cmd);
-    if (ret != 0) {
-        printf("dma_to_device failed\n");
+    if (map == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
         return 1;
     }
 
-    printf("Instruction sent successfully!\n");
+    volatile uint32_t *regs = (volatile uint32_t *)map;
+
+    // Write pattern to slv_reg0
+    regs[REG_OFFSET / 4] = pattern;
+
+    printf("Wrote pattern %u to AXI-Lite register 0x%x\n",
+           pattern, REG_OFFSET);
+
+    munmap(map, MAP_SIZE);
+    close(fd);
     return 0;
 }
